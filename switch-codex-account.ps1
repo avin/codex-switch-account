@@ -18,6 +18,115 @@ $LiveAuthFile = Join-Path $CodexHome 'auth.json'
 $AccountCount = $null
 $PackageFamilyName = $null
 
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class CodexWindowAutomation
+{
+    private const uint INPUT_KEYBOARD = 1;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+    private const ushort VK_CONTROL = 0x11;
+    private const ushort VK_Q = 0x51;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct INPUT
+    {
+        public uint type;
+        public INPUTUNION data;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct INPUTUNION
+    {
+        [FieldOffset(0)] public MOUSEINPUT mouse;
+        [FieldOffset(0)] public KEYBDINPUT keyboard;
+        [FieldOffset(0)] public HARDWAREINPUT hardware;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MOUSEINPUT
+    {
+        public int dx;
+        public int dy;
+        public uint mouseData;
+        public uint flags;
+        public uint time;
+        public UIntPtr extraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KEYBDINPUT
+    {
+        public ushort virtualKey;
+        public ushort scanCode;
+        public uint flags;
+        public uint time;
+        public UIntPtr extraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct HARDWAREINPUT
+    {
+        public uint message;
+        public ushort parameterLow;
+        public ushort parameterHigh;
+    }
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetForegroundWindow(IntPtr windowHandle);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool ShowWindowAsync(IntPtr windowHandle, int command);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr windowHandle, out uint processId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint SendInput(uint inputCount, INPUT[] inputs, int inputSize);
+
+    private static INPUT Key(ushort virtualKey, uint flags)
+    {
+        return new INPUT {
+            type = INPUT_KEYBOARD,
+            data = new INPUTUNION {
+                keyboard = new KEYBDINPUT {
+                    virtualKey = virtualKey,
+                    flags = flags
+                }
+            }
+        };
+    }
+
+    public static void SendCtrlQ()
+    {
+        INPUT[] inputs = {
+            Key(VK_CONTROL, 0),
+            Key(VK_Q, 0),
+            Key(VK_Q, KEYEVENTF_KEYUP),
+            Key(VK_CONTROL, KEYEVENTF_KEYUP)
+        };
+
+        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
+        if (sent != inputs.Length) {
+            // Avoid leaving a modifier logically pressed if input injection was partial.
+            INPUT[] releases = {
+                Key(VK_Q, KEYEVENTF_KEYUP),
+                Key(VK_CONTROL, KEYEVENTF_KEYUP)
+            };
+            SendInput((uint)releases.Length, releases, Marshal.SizeOf<INPUT>());
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not send Ctrl+Q.");
+        }
+    }
+}
+'@
+
 function Write-Info([string] $Message) {
     Write-Host "[INFO] $Message" -ForegroundColor Cyan
 }
@@ -156,6 +265,43 @@ function Get-CodexBackendProcesses {
     return @(Get-CimInstance Win32_Process -Filter "Name = 'codex.exe'" -ErrorAction Stop)
 }
 
+function Invoke-ChatGPTQuitShortcut {
+    param([object[]] $Processes)
+
+    foreach ($item in $Processes) {
+        try {
+            $process = Get-Process -Id ([int] $item.ProcessId) -ErrorAction Stop
+            $windowHandle = $process.MainWindowHandle
+            if ($windowHandle -eq [IntPtr]::Zero) {
+                continue
+            }
+
+            # Ctrl+Q is an application-level quit command. Never send it until
+            # the foreground window is confirmed to belong to this process.
+            $null = [CodexWindowAutomation]::ShowWindowAsync($windowHandle, 9) # SW_RESTORE
+            $null = [CodexWindowAutomation]::SetForegroundWindow($windowHandle)
+
+            $activationDeadline = [DateTime]::UtcNow.AddSeconds(2)
+            do {
+                $foregroundWindow = [CodexWindowAutomation]::GetForegroundWindow()
+                $foregroundProcessId = [uint32] 0
+                $null = [CodexWindowAutomation]::GetWindowThreadProcessId($foregroundWindow, [ref] $foregroundProcessId)
+                if ($foregroundProcessId -eq [uint32] $item.ProcessId) {
+                    [CodexWindowAutomation]::SendCtrlQ()
+                    Write-Info 'Sent Ctrl+Q to Codex desktop for a normal application exit.'
+                    return $true
+                }
+                Start-Sleep -Milliseconds 100
+            } while ([DateTime]::UtcNow -lt $activationDeadline)
+        }
+        catch {
+            Write-Info "Could not request application exit with Ctrl+Q: $($_.Exception.Message)"
+        }
+    }
+
+    return $false
+}
+
 function Stop-AllCodexProcesses {
     $processes = @(Get-ChatGPTProcesses)
     $backendProcesses = @(Get-CodexBackendProcesses)
@@ -164,37 +310,36 @@ function Stop-AllCodexProcesses {
         return
     }
 
-    Write-Info "Closing $($processes.Count) ChatGPT.exe process(es)..."
-    foreach ($item in $processes) {
-        try {
-            $process = Get-Process -Id ([int] $item.ProcessId) -ErrorAction Stop
-            if ($process.MainWindowHandle -ne 0) {
-                $null = $process.CloseMainWindow()
+    $quitRequested = Invoke-ChatGPTQuitShortcut -Processes $processes
+    if (-not $quitRequested) {
+        Write-Info 'Could not activate the Codex window for Ctrl+Q; requesting window closure instead.'
+        foreach ($item in $processes) {
+            try {
+                $process = Get-Process -Id ([int] $item.ProcessId) -ErrorAction Stop
+                if ($process.MainWindowHandle -ne 0) {
+                    $null = $process.CloseMainWindow()
+                }
             }
-        }
-        catch {
-            # The process may have exited between discovery and this request.
+            catch {
+                # The process may have exited between discovery and this request.
+            }
         }
     }
 
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
         Start-Sleep -Milliseconds 250
-        $remaining = @(Get-ChatGPTProcesses)
+        $remaining = @(
+            Get-ChatGPTProcesses
+            Get-CodexBackendProcesses
+        )
     } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
 
     if ($remaining.Count -gt 0) {
-        Write-Info 'Graceful shutdown timed out; stopping remaining ChatGPT.exe processes.'
+        Write-Info 'Normal application exit timed out; stopping remaining ChatGPT/Codex processes.'
         foreach ($item in $remaining) {
             Stop-Process -Id ([int] $item.ProcessId) -Force -ErrorAction SilentlyContinue
         }
-    }
-
-    # The desktop app may leave its codex.exe backend alive briefly. It must not
-    # be allowed to update auth.json during the switch.
-    $backendProcesses = @(Get-CodexBackendProcesses)
-    foreach ($item in $backendProcesses) {
-        Stop-Process -Id ([int] $item.ProcessId) -Force -ErrorAction SilentlyContinue
     }
 
     Start-Sleep -Milliseconds 500
